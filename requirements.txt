@@ -1,0 +1,6 @@
+accelerate>=0.31.0
+torchvision
+datasets
+peft>=0.11.1
+wandb
+hpsv2
