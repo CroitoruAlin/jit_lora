@@ -1,148 +1,142 @@
-# LoRA fine-tuning for JiT
+# JiT fine-tuning
 
-[`JiTTransformer2DModel`](../../../src/diffusers/models/transformers/jit_transformer_2d.py) is a pixel-space,
-class-conditional (ImageNet, 1000 classes) transformer trained with flow matching: it takes a noisy image and a
-timestep and predicts the clean image directly, with no VAE involved. `train_lora_jit.py` fine-tunes a pretrained
-JiT checkpoint with [LoRA](https://huggingface.co/docs/peft/conceptual_guides/lora) on an arbitrary image dataset,
-loosely following the training recipe from the JiT paper,
-["Back to Basics: Let Denoising Generative Models Denoise"](https://arxiv.org/abs/2511.13720).
+Full fine-tuning of [JiT](https://arxiv.org/abs/2511.13720) (pixel-space, class-conditional diffusion transformer) on
+CelebA-HQ 256×256, with:
 
-The target is not plain `x0` but a frequency-masked version of it: its 2D FFT is radially cropped to a cutoff that
-grows with `t`, so at high noise levels the model is only asked to recover low-frequency structure, and at low
-noise levels the target includes the full spectrum. The noised input is built from this **same masked image**, not
-the true `x0` (`z_t = t * target + (1 - t) * noise`): at inference there is no true `x0` for high-frequency content
-to leak in from, so noising with the true image would train on inputs inconsistent with what the model actually
-sees when sampling. Building both `z_t` and the target from the same masked image keeps the corruption process
-self-consistent, as in blurring/soft-diffusion formulations, rather than asking the model to discard real detail
-that's diluted into its own input. This is combined with the paper's `1 / (1 - t)^2` implicit loss weight (normally
-obtained "for free" from a velocity-space reformulation of the x0-MSE; applied here as an explicit weight since the
-target is no longer plain `x0`).
-
-Unlike the paper, `t` is sampled **uniformly** from `(0, 1)` rather than from a logit-normal distribution biased
-toward noisier timesteps. That bias was tuned for a plain x0-MSE loss, where the near-noise task is the hard,
-undertrained one; the frequency-masked target above already makes the near-noise task easier on its own (a much
-simpler target), so keeping the paper's bias on top would starve higher-`t`, higher-detail steps of training
-signal. Concretely: combining the paper's `logit_normal(mean=-0.8)` with the frequency-mask schedule left over 99%
-of training steps with a target that never reached even half of the full spectrum — the model never learned to
-add detail because it was (almost) never asked to.
-
-Since most fine-tuning datasets aren't labeled with ImageNet classes, every training example is conditioned on the
-model's built-in null class (the same token JiT was trained to use for unconditional/classifier-free-guidance
-sampling), effectively adapting the pretrained backbone to a new, unconditional image domain.
+- `train_full_jit_baseline.py` — the plain JiT recipe (x0-prediction, `1/(1-t)^2`-weighted loss).
+- `train_full_freq.py` — the same, plus a frequency-band-weighted velocity loss (`--freq_loss`), a phase-coherence
+  loss (`--phase_loss_weight`), and frequency diagnostics logged to wandb.
 
 ## Setup
 
-`JiTTransformer2DModel` and `JiTPipeline` only exist in this local checkout, not yet in a released `diffusers`
-version on PyPI, so install *this* repo in editable mode rather than a plain `pip install diffusers` (which would
-silently give you a `diffusers` without JiT support). From the repo root:
+### 1. Python environment
+
+Python 3.12. Install a PyTorch build matching your CUDA version first (see [pytorch.org](https://pytorch.org/get-started/locally/));
+this repo was run with torch 2.13 + CUDA 13.0 on RTX 5090s.
 
 ```bash
-pip install -e ".[dev]"
-pip install -r examples/research_projects/jit_lora/requirements.txt
+uv venv -p 3.12 .venv
+source .venv/bin/activate
+uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
 ```
 
-If you already have a different `diffusers` installed, `pip install -e .` will replace it in your environment with
-this checkout (verify with `python -c "import diffusers; print(diffusers.__file__)"` — it should point inside this
-`diffusers/src/diffusers` directory).
+### 2. diffusers with JiT
 
-Logging defaults to [Weights & Biases](https://wandb.ai); run `wandb login` (or set `WANDB_API_KEY`) beforehand, or
-pass `--report_to=tensorboard` to use TensorBoard instead.
+JiT is not in released diffusers yet. The `jit/` folder holds its source files (from the
+`add-jit-diffusion` branch of [AlanPonnachan/diffusers](https://github.com/AlanPonnachan/diffusers), with
+`PeftAdapterMixin` added so LoRA adapters can be loaded), laid out at the same paths as in diffusers:
 
-## Usage
+```
+jit/
+├── src/diffusers/models/transformers/jit_transformer_2d.py   # JiTTransformer2DModel
+├── src/diffusers/pipelines/jit/__init__.py
+├── src/diffusers/pipelines/jit/pipeline_jit.py               # JiTPipeline
+├── register_jit.py                                           # adds the exports to diffusers' __init__.py files
+└── convert_checkpoint.py                                     # converts the pretrained weights (step 3)
+```
 
-The default configuration fine-tunes [`JiT-diffusers/JiT-B-16`](https://huggingface.co/JiT-diffusers/JiT-B-16) on
-[`korexyz/celeba-hq-256x256`](https://huggingface.co/datasets/korexyz/celeba-hq-256x256), which already ships
-256x256 images matching JiT-B/16's native resolution:
+Clone diffusers, copy the JiT source in, register it, and install diffusers in editable mode:
 
 ```bash
-accelerate launch train_lora_jit.py \
-  --pretrained_model_name_or_path="JiT-diffusers/JiT-B-16" \
-  --dataset_name="korexyz/celeba-hq-256x256" \
-  --output_dir="jit-lora-celeba-hq" \
-  --train_batch_size=16 \
-  --gradient_accumulation_steps=1 \
-  --learning_rate=1e-4 \
-  --rank=16 \
-  --num_train_epochs=50 \
-  --checkpointing_steps=500 \
-  --validation_epochs=5 \
-  --mixed_precision="bf16"
+git clone https://github.com/huggingface/diffusers.git
+cp -r jit/src/. diffusers/src/
+python jit/register_jit.py diffusers
+uv pip install -e ./diffusers
+uv pip install -r requirements.txt
 ```
 
-Notable options:
-
-- `--rank` / `--lora_alpha` / `--lora_dropout`: standard LoRA hyperparameters.
-- `--lora_layers`: comma-separated module names to attach LoRA to. Defaults to the attention projections
-  (`to_q`, `to_k`, `to_v`, `to_out.0`) and the SwiGLU MLP projections (`w12`, `w3`) in every block.
-- `--t_eps`: clips `(1 - t)` in the loss weight `1 / (1 - t)^2` to avoid a division blowup near `t=1`, matching the
-  JiT paper's clipping (default `0.05`).
-- `--freq_mask_alpha` / `--freq_mask_saturation_t`: the FFT cutoff is derived from where per-frequency signal power
-  (natural images fall off as `~1/f^alpha`, `alpha` default `2.0`) equals the injected noise power, which is flat
-  across frequencies. `--freq_mask_saturation_t` (default `0.7`) is the `t` value at which the cutoff first reaches
-  1.0 (full detail); it exists because the signal-vs-noise comparison needs a calibration constant that can't be
-  derived from `alpha` alone. With uniform `t` sampling, `0.7` means ~19% of training steps stay heavily blurred
-  (`cutoff_fraction < 0.1`) and ~31% see near-full detail (`cutoff_fraction > 0.95`); raise it toward `1.0` for a
-  longer, more aggressive low-frequency-only curriculum (e.g. `0.9` leaves ~47% of steps heavily blurred and only
-  ~10% near-full detail).
-- `--freq_mask_transition`: width of the smooth rolloff around the FFT cutoff. The cutoff is a sigmoid, not a hard
-  step, to avoid ringing (Gibbs phenomenon) artifacts in the target that a brick-wall cutoff would otherwise bake
-  in and the model would learn to reproduce. Default `0.1`; going much below that (e.g. `0.05`) reintroduces
-  visible ringing.
-- `--validation_epochs` / `--num_validation_images`: periodically samples images with the in-training LoRA weights
-  and logs them to Weights & Biases (or TensorBoard with `--report_to=tensorboard`).
-
-Only the LoRA adapter weights are saved (as `pytorch_lora_weights.safetensors`), both in intermediate
-`checkpoint-*` directories and in `--output_dir` at the end of training.
-
-## Inference
-
-```python
-import torch
-from diffusers import FlowMatchEulerDiscreteScheduler, JiTPipeline, JiTTransformer2DModel
-
-transformer = JiTTransformer2DModel.from_pretrained("JiT-diffusers/JiT-B-16", subfolder="transformer")
-transformer.load_lora_adapter("jit-lora-celeba-hq", prefix=None, weight_name="pytorch_lora_weights.safetensors")
-
-pipe = JiTPipeline(transformer=transformer, scheduler=FlowMatchEulerDiscreteScheduler(shift=4.0))
-pipe.to("cuda")
-
-null_class = transformer.config.num_classes  # unconditional token used during fine-tuning
-image = pipe(class_labels=null_class, guidance_scale=1.0, num_inference_steps=50).images[0]
-image.save("sample.png")
-```
-
-## Evaluation
-
-`eval_lora_jit.py` generates a batch of images with a trained LoRA checkpoint and scores them with the LAION
-"improved aesthetic predictor" and [HPSv2](https://github.com/tgxs002/HPSv2):
+Check it worked:
 
 ```bash
-python eval_lora_jit.py \
-  --pretrained_model_name_or_path="JiT-diffusers/JiT-B-16" \
-  --lora_path="jit-lora-celeba-hq" \
-  --num_images=100 \
-  --guidance_scale=1.0
+python -c "from diffusers import JiTPipeline, JiTTransformer2DModel"
 ```
 
-`--class_label` defaults to the null class (`transformer.config.num_classes`) — pass the same class the LoRA was
-actually trained with if it differs. Results (per-image and aggregate mean/std) are written to
-`<output_dir>/scores.json`; generated images go to `<output_dir>/images/`.
+### 3. Pretrained checkpoints
 
-HPSv2 is a text-image preference score (it compares images generated from the *same prompt*), but this LoRA is
-class-conditional, not text-conditional, so there's no natural prompt for the generated images. `--hps_prompt`
-(default `"a photo of a face"`) is a generic stand-in — treat the HPSv2 number as a rough general-quality proxy,
-not a prompt-faithfulness score in the usual HPS sense.
-
-**Known issue in `hpsv2==1.2.0`:** the PyPI package vendors its own `open_clip` copy but the wheel is missing its
-BPE vocab data file, so `hpsv2.score(...)` fails with `FileNotFoundError: ... bpe_simple_vocab_16e6.txt.gz`. Fix by
-copying the file from a real `open_clip_torch` install:
+Download the JiT checkpoints (needs `git lfs`), then convert the transformer weights to the attention layout used by
+`jit_transformer_2d.py` (splits the fused `qkv` projection; the original file is kept as `*.bak`):
 
 ```bash
-pip install open_clip_torch
-python -c "
-import shutil, hpsv2, open_clip, pathlib
-src = pathlib.Path(open_clip.__file__).parent / 'bpe_simple_vocab_16e6.txt.gz'
-dst = pathlib.Path(hpsv2.__file__).parent / 'src' / 'open_clip' / 'bpe_simple_vocab_16e6.txt.gz'
-shutil.copy(src, dst)
-"
+git lfs install
+git clone https://huggingface.co/BiliSakura/JiT-diffusers
+python jit/convert_checkpoint.py JiT-diffusers/JiT-B-16
+```
+
+Pass more variant folders (e.g. `JiT-diffusers/JiT-L-16`) to convert them too. Re-running on an already converted
+folder is a no-op.
+
+### 4. Logging
+
+Both scripts log to wandb:
+
+```bash
+wandb login
+```
+
+## Training
+
+The CelebA-HQ dataset (`korexyz/celeba-hq-256x256`) is downloaded from the Hugging Face Hub on first run.
+`accelerate launch` uses every visible GPU; restrict it with `CUDA_VISIBLE_DEVICES=0` or set it up once with
+`accelerate config`. The effective batch size is `--train_batch_size` (default 16) × number of GPUs.
+
+### Baseline
+
+```bash
+accelerate launch train_full_jit_baseline.py \
+  --pretrained_model_name_or_path=JiT-diffusers/JiT-B-16 \
+  --dataset_name=korexyz/celeba-hq-256x256 \
+  --seed=0 \
+  --class_label=0 --class_dropout_prob=0.1 \
+  --mixed_precision=bf16 \
+  --learning_rate=1e-4 --max_train_steps=15000 \
+  --checkpointing_steps=5000 --validation_epochs=5 \
+  --t_sampling=logit_normal \
+  --output_dir=runs/00_baseline
+```
+
+### Frequency-weighted + phase loss
+
+Same shared settings, plus the frequency loss, the phase loss and the diagnostics:
+
+```bash
+accelerate launch train_full_freq.py \
+  --pretrained_model_name_or_path=JiT-diffusers/JiT-B-16 \
+  --dataset_name=korexyz/celeba-hq-256x256 \
+  --seed=0 \
+  --class_label=0 --class_dropout_prob=0.1 \
+  --mixed_precision=bf16 \
+  --learning_rate=1e-4 --max_train_steps=15000 \
+  --checkpointing_steps=5000 --validation_epochs=5 \
+  --t_sampling=logit_normal \
+  --freq_log_steps=200 --num_freq_bands=8 --transmission_log_steps=1000 \
+  --freq_loss --freq_schedule=static --freq_weight_power=1.0 --freq_weight_scale=3.0 \
+  --phase_loss_weight=0.2 --phase_loss_gamma=3.0 --phase_loss_gamma_low=0.5 \
+  --output_dir=runs/D1_w0.2_gl0.5
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `--freq_loss` | Replace the baseline loss with an FFT-domain velocity loss weighted per radial frequency band. |
+| `--freq_weight_scale`, `--freq_weight_power` | Band weights: `1 + scale * (band / (num_bands - 1)) ** power` (DC = 1, highest band = `1 + scale`). |
+| `--phase_loss_weight` | Weight of the phase-coherence loss; `0` disables it. |
+| `--phase_loss_gamma_low`, `--phase_loss_gamma` | Phase loss is faded in by `t ** gamma`, with gamma ramping from `gamma_low` (DC) to `gamma` (highest band). |
+| `--freq_log_steps` | Log residual spectra, reconstructions and band-vs-t error heatmaps every N steps; `0` disables. |
+| `--transmission_log_steps` | Log how much of each band survives the patch-embedding bottleneck every N steps; `0` disables. |
+
+`run.sh` holds the full sweep (commented-out blocks are earlier runs).
+
+### Outputs
+
+```
+runs/<name>/
+├── checkpoint-5000/transformer/   # intermediate weights (plus accelerate optimizer state)
+├── ...
+└── transformer/                   # final weights
+```
+
+Each `transformer/` folder loads with `JiTTransformer2DModel.from_pretrained(...)`. To score one with the LAION
+aesthetic predictor and HPSv2:
+
+```bash
+python eval_lora_jit.py --transformer_path runs/D1_w0.2_gl0.5 --output_dir eval_output/D1
 ```

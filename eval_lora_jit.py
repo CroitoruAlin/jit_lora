@@ -86,10 +86,14 @@ def parse_args():
     )
     parser.add_argument("--revision", type=str, default=None)
     parser.add_argument(
+        "--transformer_path",
+        type=str,
+        default=None
+    )
+    parser.add_argument(
         "--lora_path",
         type=str,
-        required=True,
-        help="Directory containing `pytorch_lora_weights.safetensors`, i.e. a `train_lora_jit.py --output_dir`.",
+        default=None,
     )
     parser.add_argument("--num_images", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=10)
@@ -113,11 +117,25 @@ def parse_args():
     return parser.parse_args()
 
 
+def resolve_transformer_path(path):
+    """Accept a run dir, a `checkpoint-N` dir, or a `transformer/` folder; return the folder holding `config.json`."""
+    path = Path(path)
+    if (path / "config.json").is_file():
+        return path
+    if (path / "transformer" / "config.json").is_file():
+        return path / "transformer"
+    raise FileNotFoundError(f"No transformer `config.json` found in {path} or {path / 'transformer'}")
+
+
 def generate_images(args, device):
-    transformer = JiTTransformer2DModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision
-    )
-    transformer.load_lora_adapter(args.lora_path, prefix=None, weight_name="pytorch_lora_weights.safetensors")
+    if args.transformer_path is not None:
+        transformer = JiTTransformer2DModel.from_pretrained(resolve_transformer_path(args.transformer_path))
+    else:
+        transformer = JiTTransformer2DModel.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision
+        )
+    if args.lora_path is not None:
+        transformer.load_lora_adapter(args.lora_path, prefix=None, weight_name="pytorch_lora_weights.safetensors")
 
     noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="scheduler", revision=args.revision
@@ -198,6 +216,7 @@ def main(args):
     hps_std = (sum((s - hps_mean) ** 2 for s in hps_scores) / len(hps_scores)) ** 0.5
 
     summary = {
+        "transformer_path": args.transformer_path,
         "lora_path": args.lora_path,
         "num_images": len(image_paths),
         "aesthetic_score_mean": aesthetic_mean,
@@ -213,7 +232,7 @@ def main(args):
     summary_path = Path(args.output_dir) / "scores.json"
     summary_path.write_text(json.dumps(summary, indent=2))
 
-    print(f"\nGenerated {len(image_paths)} images from {args.lora_path}")
+    print(f"\nGenerated {len(image_paths)} images from {args.lora_path or args.transformer_path or args.pretrained_model_name_or_path}")
     print(f"LAION aesthetic score: {aesthetic_mean:.4f} +/- {aesthetic_std:.4f}")
     print(f"HPSv2 ({args.hps_prompt!r}):  {hps_mean:.4f} +/- {hps_std:.4f}")
     print(f"Full results written to {summary_path}")
